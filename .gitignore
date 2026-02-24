@@ -1,0 +1,49 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Cloned external repos — don't track these
+data/
+benchmarking/
+reference/
+
+# cl-bench: exclude outputs, data (except observation_8.jsonl), and misc
+cl-bench/outputs/
+cl-bench/data/*
+!cl-bench/data/observation_8.jsonl
+cl-bench/CL-bench.jsonl
+cl-bench/.github/
+cl-bench/.cache/
+cl-bench/CNAME
+cl-bench/LICENSE
+
+# Others (external repos, utilities, misc)
+others/
+
+# Tools (generated/utility scripts)
+tools/
+
+# Submissions (generated output)
+submissions/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
