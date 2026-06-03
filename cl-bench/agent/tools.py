@@ -104,10 +104,20 @@ class ContextTools:
 
     def execute(self, tool_name, tool_input):
         """Execute a tool by name."""
+        # Coerce string-typed integers (some models return "2" instead of 2)
+        coerced = {}
+        for k, v in tool_input.items():
+            if isinstance(v, str) and k in ("context_lines", "max_matches", "start_line", "end_line"):
+                try:
+                    v = int(v)
+                except ValueError:
+                    pass
+            coerced[k] = v
+
         if tool_name == "search_context":
-            return self.search_context(**tool_input)
+            return self.search_context(**coerced)
         elif tool_name == "read_lines":
-            return self.read_lines(**tool_input)
+            return self.read_lines(**coerced)
         else:
             return {"status": "error", "message": f"Unknown tool: {tool_name}"}
 
@@ -164,4 +174,18 @@ TOOL_DEFINITIONS = [
             "required": ["start_line", "end_line"],
         },
     },
+]
+
+
+# OpenAI-format tool definitions (used by litellm for all providers)
+TOOLS_OPENAI_FORMAT = [
+    {
+        "type": "function",
+        "function": {
+            "name": t["name"],
+            "description": t["description"],
+            "parameters": t["input_schema"],
+        },
+    }
+    for t in TOOL_DEFINITIONS
 ]

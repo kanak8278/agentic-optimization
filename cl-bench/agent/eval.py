@@ -1,8 +1,13 @@
-"""Evaluation script using Anthropic as the judge. Drop-in replacement for the original eval.py."""
+"""Evaluation script — matches official CL-bench eval.py exactly.
+
+Uses the same grading prompt, same JSON parsing, same retry logic.
+Judge model configurable (default: gpt-5 via Azure, matching official gpt-5.1).
+"""
 
 import json
 import os
 import argparse
+import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -10,7 +15,12 @@ from tqdm import tqdm
 
 from . import llm
 
-JUDGE_MODEL = "claude-sonnet-4-5-20250929"
+# Default judge — official CL-bench uses gpt-5.1 (OpenAI Direct).
+# gpt-5.1 only works from AI Workspace (SageMaker), not local.
+# Fallback: gpt-5 via Azure is the closest available locally.
+JUDGE_MODEL = "azure/gpt-5"
+MAX_RETRIES = 3
+RETRY_DELAY = 3
 
 
 def log(message):
@@ -38,101 +48,151 @@ def append_jsonl(item, path):
 
 
 def build_rubrics_text(rubrics):
+    """Build rubrics checklist — matches official eval.py exactly."""
+    if not rubrics:
+        return "No specific rubrics provided."
+
     lines = []
     for i, rubric in enumerate(rubrics, 1):
-        criteria = rubric.get("rubric_criteria", "").strip() if isinstance(rubric, dict) else str(rubric).strip()
+        if isinstance(rubric, dict):
+            criteria = rubric.get("rubric_criteria", "").strip()
+        else:
+            criteria = str(rubric).strip()
         if criteria:
             lines.append(f"{i}. {criteria}")
+
     return "\n".join(lines) if lines else "No specific rubrics provided."
 
 
-GRADING_PROMPT = """Starting now, you are a rigorous instruction-following grading teacher. Your task is to accurately grade and score student answers based on the 【Rubrics】.
+def _build_grading_prompt(rubrics_text, model_output):
+    """Build grading prompt — exact copy of official eval.py grading_prompt."""
+    return (
+        "Starting now, you are a rigorous instruction-following grading teacher. "
+        "Your task is to accurately grade and score student answers based on the 【Rubrics】.\n\n"
+        "Grading Criteria\n"
+        "This is a strict, all-or-nothing grading system. The final score is binary.\n"
+        "To receive a score of 1, the student's answer must perfectly satisfy every single "
+        "requirement listed in the 【Rubrics】.\n"
+        "If even one requirement is not fully met, the final score will be 0.\n"
+        "Grading Process\n"
+        "Please strictly follow the steps below for analysis—no steps may be skipped:\n"
+        "Step 1: Analyze the Standard Answer\n"
+        "List all explicit requirements in the 【Rubrics】 item by item "
+        "(including format, content, quantity, order, etc.).\n"
+        "Identify implicit requirements in the 【Rubrics】 (e.g., language style, logical structure).\n"
+        "Define specific evaluation criteria for each requirement "
+        "(e.g., \"must include X,\" \"must not exceed Y\").\n"
+        "Step 2: Check Each Requirement Against the Student's Answer\n"
+        "For every requirement in the 【Rubrics】, verify one by one whether the student's answer "
+        "fully satisfies it.\n"
+        "Step 3: Self-Reflection\n"
+        "Before giving the final score, you must conduct the following checks:\n"
+        "  Completeness Check: Whether all requirements in the standard answer have been reviewed "
+        "with no omissions.\n"
+        "  Strictness Check: Whether the evaluation strictly adheres to the \"fully satisfied\" "
+        "standard without relaxing requirements due to subjective judgment.\n"
+        "  Consistency Check: Whether the grading rationale aligns logically with the final score.\n"
+        "  Objectivity Check: Whether judgments are based on objective facts rather than subjective "
+        "speculation.\n"
+        "Output Format Requirements\n"
+        "【Grading Rationale】: xxx\n"
+        "【List of Requirement Satisfaction Status】: [x₁, x₂, …, xᵢ, …, xₙ] "
+        "(where n is the total number of requirements in the 【Rubrics】, and xᵢ indicates "
+        "whether the student's answer meets the i-th requirement, with values \"yes\"/\"no\")\n"
+        "【Overall Score】: x points (x is an integer, either 0 or 1.)\n\n"
+        "Content to Be Graded\n"
+        f"【Rubrics】:\n{rubrics_text}\n"
+        f"【Student Response】:\n{model_output}\n"
+        "\nPlease strictly output ONLY the following JSON format (do not output any other content):\n"
+        "{\n"
+        '  "Grading Rationale": "Your detailed grading rationale",\n'
+        '  "List of Requirement Satisfaction Status": ["yes", "no", ...],\n'
+        '  "Overall Score": 0 or 1\n'
+        "}\n"
+    )
 
-Grading Criteria
-This is a strict, all-or-nothing grading system. The final score is binary.
-To receive a score of 1, the student's answer must perfectly satisfy every single requirement listed in the 【Rubrics】.
-If even one requirement is not fully met, the final score will be 0.
 
-Grading Process
-Please strictly follow the steps below for analysis—no steps may be skipped:
+def _call_judge(rubrics_text, model_output, model=None):
+    """Call judge LLM. Returns raw text or None on failure.
 
-Step 1: Analyze the Standard Answer
-List all explicit requirements in the 【Rubrics】 item by item (including format, content, quantity, order, etc.).
-Identify implicit requirements in the 【Rubrics】 (e.g., language style, logical structure).
-Define specific evaluation criteria for each requirement (e.g., "must include X," "must not exceed Y").
-
-Step 2: Check Each Requirement Against the Student's Answer
-For every requirement in the 【Rubrics】, verify one by one whether the student's answer fully satisfies it.
-
-Step 3: Self-Reflection
-Before giving the final score, you must conduct the following checks:
-  Completeness Check: Whether all requirements in the standard answer have been reviewed with no omissions.
-  Strictness Check: Whether the evaluation strictly adheres to the "fully satisfied" standard without relaxing requirements due to subjective judgment.
-  Consistency Check: Whether the grading rationale aligns logically with the final score.
-  Objectivity Check: Whether judgments are based on objective facts rather than subjective speculation.
-
-Output Format Requirements
-Please strictly output ONLY the following JSON format (do not output any other content):
-{{
-  "Grading Rationale": "Your detailed grading rationale",
-  "List of Requirement Satisfaction Status": ["yes", "no", ...],
-  "Overall Score": 0 or 1
-}}
-
-Content to Be Graded
-【Rubrics】:
-{rubrics_text}
-
-【Student Response】:
-{model_output}"""
-
-
-def grade_single(client, rubrics_text, model_output, model=None):
-    """Grade a single response using Anthropic as judge. Returns raw grading dict."""
+    Matches official: no system prompt, just the user message.
+    """
     model = model or JUDGE_MODEL
-    prompt = GRADING_PROMPT.format(rubrics_text=rubrics_text, model_output=model_output)
+    prompt = _build_grading_prompt(rubrics_text, model_output)
+    # Official eval uses no system prompt — just messages=[{role: user, content: prompt}]
+    # Our llm.chat() prepends system as a message, so pass empty string
     messages = [{"role": "user", "content": prompt}]
 
-    response = llm.chat(client=client, system="You are a strict grading judge.", messages=messages, model=model)
-    result_text = llm.extract_text(response).strip()
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = llm.chat(system="", messages=messages, model=model)
+            result_text = llm.extract_text(response).strip()
 
-    # Strip code block wrappers
-    if result_text.startswith("```json"):
-        result_text = result_text[7:]
-    if result_text.startswith("```"):
-        result_text = result_text[3:]
-    if result_text.endswith("```"):
-        result_text = result_text[:-3]
-    result_text = result_text.strip()
+            # Remove code block wrappers (matches official)
+            if result_text.startswith("```json"):
+                result_text = result_text[7:]
+            if result_text.startswith("```"):
+                result_text = result_text[3:]
+            if result_text.endswith("```"):
+                result_text = result_text[:-3]
+            result_text = result_text.strip()
 
-    return json.loads(result_text)
+            return result_text
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                return None
 
 
-def grade_task(client, answer, rubrics, model=None):
-    """
-    Grade a task's answer against its rubrics.
+def grade_task(answer, rubrics, model=None):
+    """Grade a task's answer against rubrics with JSON parse retry.
 
-    Returns:
-        dict with keys: score, grading_rationale, requirement_status
+    Matches official eval.py process_single_item logic:
+    - If JSON parse fails, re-call the LLM (up to MAX_RETRIES times)
+    - Validates "Overall Score" field exists
     """
     if not answer or not answer.strip():
-        return {"score": 0, "grading_rationale": "Empty output", "requirement_status": [],
-                "rubrics_passed": 0, "rubrics_total": 0}
+        return {"score": 0, "grading_rationale": "Empty output",
+                "requirement_status": [], "rubrics_passed": 0, "rubrics_total": 0}
 
     rubrics_text = build_rubrics_text(rubrics)
-    try:
-        grading = grade_single(client, rubrics_text, answer, model=model)
-        status = grading.get("List of Requirement Satisfaction Status", [])
-        return {
-            "score": grading.get("Overall Score", 0),
-            "grading_rationale": grading.get("Grading Rationale", ""),
-            "requirement_status": status,
-            "rubrics_passed": sum(1 for s in status if s == "yes"),
-            "rubrics_total": len(status),
-        }
-    except Exception as e:
-        return {"score": 0, "grading_rationale": f"Grading error: {e}", "requirement_status": [],
-                "rubrics_passed": 0, "rubrics_total": 0}
+
+    for parse_attempt in range(MAX_RETRIES):
+        result_text = _call_judge(rubrics_text, answer, model=model)
+
+        if not result_text:
+            if parse_attempt < MAX_RETRIES - 1:
+                time.sleep(2)
+                continue
+            return {"score": 0, "grading_rationale": "API call failed",
+                    "requirement_status": [], "rubrics_passed": 0, "rubrics_total": 0}
+
+        try:
+            result_json = json.loads(result_text)
+
+            if "Overall Score" not in result_json:
+                raise ValueError("Missing 'Overall Score' field")
+
+            status = result_json.get("List of Requirement Satisfaction Status", [])
+            return {
+                "score": result_json.get("Overall Score", 0),
+                "grading_rationale": result_json.get("Grading Rationale", ""),
+                "requirement_status": status,
+                "rubrics_passed": sum(1 for s in status if s == "yes"),
+                "rubrics_total": len(status),
+            }
+        except (json.JSONDecodeError, ValueError):
+            if parse_attempt < MAX_RETRIES - 1:
+                time.sleep(2)
+                continue
+            return {
+                "score": 0,
+                "grading_rationale": f"JSON parse failed: {result_text[:500]}",
+                "requirement_status": [],
+                "rubrics_passed": 0,
+                "rubrics_total": 0,
+            }
 
 
 def get_task_id(item):
@@ -147,9 +207,7 @@ def calculate_statistics(output_path):
     data = load_jsonl(output_path)
     total = len(data)
     score_1 = sum(1 for item in data if item.get("score") == 1)
-    score_0 = sum(1 for item in data if item.get("score") == 0)
 
-    # Rubric-level stats
     total_rubrics = 0
     passed_rubrics = 0
     for item in data:
@@ -193,10 +251,11 @@ def calculate_statistics(output_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CL-bench Eval (Anthropic judge)")
-    parser.add_argument("--input", type=str, required=True, help="Input graded JSONL")
+    parser = argparse.ArgumentParser(description="CL-bench Eval (matches official eval.py)")
+    parser.add_argument("--input", type=str, required=True, help="Input JSONL with model_output")
     parser.add_argument("--output", type=str, default=None, help="Output JSONL")
-    parser.add_argument("--model", type=str, default=None, help="Judge model")
+    parser.add_argument("--model", type=str, default=None,
+                        help=f"Judge model (default: {JUDGE_MODEL})")
     parser.add_argument("--workers", type=int, default=1, help="Parallel workers")
     args = parser.parse_args()
 
@@ -204,11 +263,13 @@ def main():
         base = os.path.splitext(os.path.basename(args.input))[0]
         args.output = f"outputs/{base}_graded.jsonl"
 
+    judge_model = args.model or JUDGE_MODEL
+
     log(f"Input: {args.input}")
     log(f"Output: {args.output}")
+    log(f"Judge: {judge_model}")
     log(f"Workers: {args.workers}")
 
-    client = llm.get_client()
     data = load_jsonl(args.input)
     log(f"Loaded {len(data)} samples")
 
@@ -230,28 +291,16 @@ def main():
     log(f"Grading {len(pending)} tasks...")
 
     def _grade_item(item):
-        task_id = get_task_id(item)
         model_output = item.get("model_output", "")
 
         if not model_output or not model_output.strip():
-            result = {**item, "score": 0, "grading_rationale": "Empty output"}
+            result = {**item, "score": 0, "grading_rationale": "Empty output",
+                      "requirement_status": [], "rubrics_passed": 0, "rubrics_total": 0}
             append_jsonl(result, args.output)
             return
 
-        rubrics_text = build_rubrics_text(item.get("rubrics", []))
-
-        try:
-            grading = grade_single(client, rubrics_text, model_output, model=args.model)
-            result = {
-                **item,
-                "score": grading.get("Overall Score", 0),
-                "grading_rationale": grading.get("Grading Rationale", ""),
-                "requirement_status": grading.get("List of Requirement Satisfaction Status", []),
-            }
-        except Exception as e:
-            log(f"  Failed grading {task_id[:12]}...: {e}")
-            result = {**item, "score": 0, "grading_rationale": f"Grading error: {e}"}
-
+        grading = grade_task(model_output, item.get("rubrics", []), model=judge_model)
+        result = {**item, **grading}
         append_jsonl(result, args.output)
 
     if args.workers == 1:

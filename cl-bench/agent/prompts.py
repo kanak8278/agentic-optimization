@@ -4,13 +4,20 @@
 # Shared base (all experiments)
 # =============================================================================
 
-TOOL_INSTRUCTIONS = """You have tools to search and read a reference document.
-- search_context: Regex search over the document. Returns matching lines with context.
-- read_lines: Read a specific line range from the document.
+TOOL_INSTRUCTIONS = """You have tools to search and read a reference document. You MUST use these tools before answering — do NOT answer from memory of the context alone.
+
+Tools:
+- search_context(pattern): Regex search over the document. Returns matching lines with surrounding context and line numbers.
+- read_lines(start_line, end_line): Read a specific range of lines from the document (max 200 lines per call).
 
 The document is organized with these sections:
 - "## System Message" — the original instructions and role requirements
-- "## User Message First", "## User Message #2", etc. — the user's questions and context"""
+- "## User Message First", "## User Message #2", etc. — the user's questions and context
+
+Workflow:
+1. Search the document for information relevant to the question.
+2. Read specific sections to get exact details, numbers, and quotes.
+3. Only after gathering evidence from the document, formulate your answer."""
 
 RULES = """Rules:
 - Identify every part and sub-question being asked. Do not miss any.
@@ -31,7 +38,7 @@ AGENT_INSTRUCTIONS = f"""{TOOL_INSTRUCTIONS}
 # =============================================================================
 
 VERIFY_INSTRUCTION = """Before giving your final answer, you MUST verify:
-1. Re-read "## System Message" — check that you follow every requirement, constraint, persona, and formatting rule.
+1. Search for "## System Message" and re-read the role and constraints.
 2. Confirm you addressed ALL parts of the question, not just some.
 3. Use search_context/read_lines to verify specific facts, numbers, and names.
 4. Check your output format matches exactly what was requested."""
@@ -62,7 +69,7 @@ You have the same tools as the original agent:
 - read_lines: Read a specific line range from the document.
 
 Your process:
-1. Read "## System Message" to understand the role, persona, tone, and constraints the answer must follow.
+1. Search for "## System Message" to understand the role, persona, tone, and constraints the answer must follow.
 2. Read the user's question to understand exactly what was asked.
 3. Generate a checklist of what the answer SHOULD contain: required facts, tone/personality, format, completeness requirements.
 4. Compare the provided answer against your checklist.
@@ -77,4 +84,4 @@ REVISION_MESSAGE = """A verification agent reviewed your answer and found these 
 
 {verifier_feedback}
 
-First, validate each piece of feedback — the verifier may be wrong. Then improve your answer based on the valid feedback only. Respond with your revised final answer inside <answer></answer> tags. Do not include any reasoning or validation notes inside the tags — only the final answer."""
+First, validate each piece of feedback — the verifier may be wrong. Use your tools to check claims against the document. Then improve your answer based on the valid feedback only. Respond with your revised final answer inside <answer></answer> tags. Do not include any reasoning or validation notes inside the tags — only the final answer."""

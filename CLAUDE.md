@@ -1,5 +1,24 @@
 # Agentic Optimization System
 
+## AWS Authentication (Required for S3 and Mariner)
+
+Run `awslogin` before: S3 downloads, S3 dataset reads, Mariner-based configs.
+
+```bash
+awslogin                    # Uses cached password (try this first)
+awslogin 'your_password'    # Pass new password if cached one expired
+awslogin --help             # Show all options
+```
+
+- Password from **CyberArk/EPV Portal** — expires daily (~24 hours)
+- If `awslogin` fails or S3 returns `ExpiredToken`, get a new password from CyberArk
+- Claude Code cannot retrieve CyberArk passwords — user must provide it
+
+Default assumed role: `arn:aws:iam::451191978663:role/service-role/a204383-ml-workspace-TRGPT24aB-prod-use1`
+
+AWS profiles created: `tr-labs-prod` (base), `assumed-role` (TRGPT S3/Mariner access).
+Whenever running any access to bedrock should be authenticated with `awslogin` first to ensure valid credentials and run with assumed role.
+
 ## Project Phase: EXPLORATION
 
 We are in the research and idea exploration phase. No architecture is committed. No code is being written yet. The goal is to deeply understand the problem space, existing systems, and identify genuinely novel approaches before building anything.
